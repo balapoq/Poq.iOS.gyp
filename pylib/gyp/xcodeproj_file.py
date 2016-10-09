@@ -139,8 +139,10 @@ a project file is output.
 
 import gyp.common
 import posixpath
+import os
 import re
 import struct
+import subprocess
 import sys
 
 # hashlib is supplied as of Python 2.5 as the replacement interface for sha
@@ -1009,6 +1011,7 @@ class XCHierarchicalElement(XCObject):
     valid_class_types = {
       PBXFileReference: 'file',
       PBXGroup:         'group',
+      XCVersionGroup:   'group',
       PBXVariantGroup:  'file',
     }
     self_type = valid_class_types[self.__class__]
@@ -1296,9 +1299,19 @@ class PBXGroup(XCHierarchicalElement):
       next_dir = path_split[0]
       group_ref = self.GetChildByPath(next_dir)
       if group_ref != None:
-        assert group_ref.__class__ == PBXGroup
+        assert group_ref.__class__ in [PBXGroup, XCVersionGroup]
       else:
-        group_ref = PBXGroup({'path': next_dir})
+        # we have group or version group
+        (next_dir_basename, next_dir_ext) = posixpath.splitext(next_dir)
+
+        if next_dir_ext == '.xcdatamodeld':
+          # in this case we don't support any subfolder
+          # .xcdatamodeld contains all versioned .xcdatamodel
+          assert next_dir == parent_basename
+
+          group_ref = XCVersionGroup({'path': next_dir}, None, self)
+        else:
+          group_ref = PBXGroup({'path': next_dir})
         self.AppendChild(group_ref)
       return group_ref.AddOrGetFileByPath(posixpath.sep.join(path_split[1:]),
                                           hierarchical)
@@ -1700,6 +1713,74 @@ class XCConfigurationList(XCObject):
     for configuration in self._properties['buildConfigurations']:
       configuration.SetBaseConfiguration(value)
 
+# Most known usage of this is CoreData model. Few version of it wraped to group
+class XCVersionGroup(PBXGroup, XCFileLikeElement):
+  _schema = PBXGroup._schema.copy()
+  _schema.update({
+    'currentVersion':   [0, PBXFileReference,     0, 0],
+    'path':             [0, str,                  0, 1],
+    'versionGroupType': [0, str,                  0, 1, 'wrapper.xcdatamodel'],
+  })
+
+  def __init__(self, properties=None, id=None, parent=None):
+    # super
+    PBXGroup.__init__(self, properties, id, parent)
+    self._children_by_path = {}
+    self._variant_children_by_name_and_path = {}
+    for child in self._properties.get('children', []):
+      self._AddChildToDicts(child)
+
+    # only problem - if project don't lays in working directory
+
+    version_container_relative_path = os.path.join(parent.FullPath(), self._properties['path'])
+    version_file_path_relative = os.path.join(version_container_relative_path, '.xccurrentversion')
+    version_file_path_abse = os.path.abspath(version_file_path_relative)
+
+    exists = os.path.isfile(version_file_path_abse)
+    # if exists == False assume container with 1 file
+    # xcode will make it current version
+    if exists:
+      contents = ['/usr/libexec/PlistBuddy', '-c', 'Print _XCCurrentVersionName', version_file_path_abse]
+
+      process = subprocess.Popen(contents, stdout=subprocess.PIPE, executable='/usr/libexec/PlistBuddy')
+      # we will take firast line as response
+      for line in process.stdout:
+        self._properties['currentVersionFileName'] = line.replace("\n", "")
+        break
+
+
+  def VerifyHasRequiredProperties(self):
+    PBXGroup.VerifyHasRequiredProperties(self)
+    versionFileName = self._properties['currentVersionFileName']
+    if versionFileName != None:
+      versionFile = self.GetChildByName(versionFileName)
+      self._properties['currentVersion'] = versionFile
+      del self._properties['currentVersionFileName']
+
+  def AddOrGetFileByPath(self, path, hierarchical):
+    """
+    Here we just add child
+    And return self, since this group must be a build file
+    """
+
+    # Adding or getting a directory?  Directories end with a trailing slash.
+    is_dir = False
+    if path.endswith('/'):
+      is_dir = True
+
+    assert not is_dir
+    path = posixpath.normpath(path)
+
+    # Add or get a PBXFileReference.
+    file_ref = self.GetChildByPath(path)
+    if file_ref != None:
+      assert file_ref.__class__ == PBXFileReference
+    else:
+      file_ref = PBXFileReference({'path': path})
+      self.AppendChild(file_ref)
+
+    return self
+
 
 class PBXBuildFile(XCObject):
   _schema = XCObject._schema.copy()
@@ -1859,8 +1940,17 @@ class XCBuildPhase(XCObject):
       # There's already a PBXBuildFile in this phase corresponding to the
       # PBXVariantGroup.  path just provides a new variant that belongs to
       # the group.  Add the path to the dict.
+
+      #other_pbxproject = other.PBXProjectAncestor()
       pbxbuildfile = self._files_by_xcfilelikeelement[file_ref]
       self._AddBuildFileToDicts(pbxbuildfile, path)
+    elif isinstance(file_ref, XCVersionGroup):
+      pbxbuildfile = PBXBuildFile({'fileRef': file_ref})
+      path = file_ref.FullPath()
+
+      # we need avoid multiple adding of the same group as build file
+      if path not in self._files_by_path:
+        self.AppendBuildFile(pbxbuildfile, None)
     else:
       # Add a new PBXBuildFile to get file_ref into the phase.
       if settings is None:

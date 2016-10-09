@@ -1295,6 +1295,40 @@ exit 1
             configuration['xcode_config_file'])
         xcbc.SetBaseConfiguration(config_ref)
 
+  # post processing. ui test special case
+  project_attributes['TargetAttributes'] = {}
+
+  # for every UI test target find app target and set  dict like
+  # E92135C316B1FF66540867C9 = {
+  #   TestTargetID = 146417678F31AA726C00C3AF;
+  # };
+  # for app target 
+  # E92135C316B1FF66540867C9 = {
+  #   DevelopmentTeam = <Development_Team_Id>;
+  #   ProvisioningStyle = Manual;
+  # };
+  for qualified_target, target in xcode_targets.iteritems():
+    if 'ui-testing' in target._properties['productType']:
+      configuration = target.DefaultConfiguration()
+      appTargetName = configuration.GetBuildSetting('TEST_TARGET_NAME')
+      print appTargetName
+      if appTargetName is not None:
+        # we need another name
+        for qualified_target in target_list:
+          [build_file, target_name, toolset] = gyp.common.ParseQualifiedTarget(qualified_target)
+          if target_name == appTargetName:
+            app_target = xcode_targets[qualified_target]
+            if app_target is not None:
+              project_attributes['TargetAttributes'][target] = {'TestTargetID':  app_target}
+
+    # application target
+    if 'application' in target._properties['productType']:
+      # for a while lets set default: Poq Studio ltd. (Enteprise)
+      team_id = generator_flags.get('dev_team_id', None)
+      if team_id:
+        project_attributes['TargetAttributes'][target] = {'DevelopmentTeam':  team_id, 'ProvisioningStyle': 'Manual'}
+
+
   build_files = []
   for build_file, build_file_dict in data.iteritems():
     if build_file.endswith('.gyp'):
